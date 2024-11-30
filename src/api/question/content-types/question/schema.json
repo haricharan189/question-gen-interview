@@ -1,0 +1,27 @@
+{
+  "kind": "collectionType",
+  "collectionName": "questions",
+  "info": {
+    "singularName": "question",
+    "pluralName": "questions",
+    "displayName": "Questions"
+  },
+  "options": {
+    "draftAndPublish": true
+  },
+  "pluginOptions": {},
+  "attributes": {
+    "questions": {
+      "type": "text"
+    },
+    "Specifics": {
+      "type": "enumeration",
+      "enum": [
+        "skill",
+        "role",
+        "company",
+        "general"
+      ]
+    }
+  }
+}
