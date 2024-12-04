@@ -392,11 +392,17 @@ export interface ApiApplicantDetailApplicantDetail
       'api::applicant-detail.applicant-detail'
     > &
       Schema.Attribute.Private;
+    media: Schema.Attribute.Relation<'oneToMany', 'api::media.media'>;
     Name: Schema.Attribute.String;
     publishedAt: Schema.Attribute.DateTime;
+    queries: Schema.Attribute.Relation<'oneToMany', 'api::query.query'>;
     Resume: Schema.Attribute.Media<
       'images' | 'files' | 'videos' | 'audios',
       true
+    >;
+    resume_insights: Schema.Attribute.Relation<
+      'oneToMany',
+      'api::resume-insight.resume-insight'
     >;
     Role_Description: Schema.Attribute.Text;
     Target_Company: Schema.Attribute.String;
@@ -410,6 +416,7 @@ export interface ApiApplicantDetailApplicantDetail
 export interface ApiMediaMedia extends Struct.CollectionTypeSchema {
   collectionName: 'medias';
   info: {
+    description: '';
     displayName: 'Media';
     pluralName: 'medias';
     singularName: 'media';
@@ -418,6 +425,10 @@ export interface ApiMediaMedia extends Struct.CollectionTypeSchema {
     draftAndPublish: true;
   };
   attributes: {
+    applicant_detail: Schema.Attribute.Relation<
+      'manyToOne',
+      'api::applicant-detail.applicant-detail'
+    >;
     createdAt: Schema.Attribute.DateTime;
     createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
@@ -439,6 +450,7 @@ export interface ApiMediaMedia extends Struct.CollectionTypeSchema {
 export interface ApiQueryQuery extends Struct.CollectionTypeSchema {
   collectionName: 'queries';
   info: {
+    description: '';
     displayName: 'Queries';
     pluralName: 'queries';
     singularName: 'query';
@@ -447,6 +459,10 @@ export interface ApiQueryQuery extends Struct.CollectionTypeSchema {
     draftAndPublish: true;
   };
   attributes: {
+    applicant_detail: Schema.Attribute.Relation<
+      'manyToOne',
+      'api::applicant-detail.applicant-detail'
+    >;
     createdAt: Schema.Attribute.DateTime;
     createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
@@ -487,6 +503,39 @@ export interface ApiQuestionQuestion extends Struct.CollectionTypeSchema {
     Specifics: Schema.Attribute.Enumeration<
       ['skill', 'role', 'company', 'general']
     >;
+    updatedAt: Schema.Attribute.DateTime;
+    updatedBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
+      Schema.Attribute.Private;
+  };
+}
+
+export interface ApiResumeInsightResumeInsight
+  extends Struct.CollectionTypeSchema {
+  collectionName: 'resume_insights';
+  info: {
+    displayName: 'resume_insights';
+    pluralName: 'resume-insights';
+    singularName: 'resume-insight';
+  };
+  options: {
+    draftAndPublish: true;
+  };
+  attributes: {
+    applicant_detail: Schema.Attribute.Relation<
+      'manyToOne',
+      'api::applicant-detail.applicant-detail'
+    >;
+    createdAt: Schema.Attribute.DateTime;
+    createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
+      Schema.Attribute.Private;
+    Insights: Schema.Attribute.Text;
+    locale: Schema.Attribute.String & Schema.Attribute.Private;
+    localizations: Schema.Attribute.Relation<
+      'oneToMany',
+      'api::resume-insight.resume-insight'
+    > &
+      Schema.Attribute.Private;
+    publishedAt: Schema.Attribute.DateTime;
     updatedAt: Schema.Attribute.DateTime;
     updatedBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
@@ -1006,6 +1055,7 @@ declare module '@strapi/strapi' {
       'api::media.media': ApiMediaMedia;
       'api::query.query': ApiQueryQuery;
       'api::question.question': ApiQuestionQuestion;
+      'api::resume-insight.resume-insight': ApiResumeInsightResumeInsight;
       'plugin::content-releases.release': PluginContentReleasesRelease;
       'plugin::content-releases.release-action': PluginContentReleasesReleaseAction;
       'plugin::i18n.locale': PluginI18NLocale;

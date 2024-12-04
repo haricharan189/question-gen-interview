@@ -1,28 +1,24 @@
 {
   "kind": "collectionType",
-  "collectionName": "queries",
+  "collectionName": "resume_insights",
   "info": {
-    "singularName": "query",
-    "pluralName": "queries",
-    "displayName": "Queries",
-    "description": ""
+    "singularName": "resume-insight",
+    "pluralName": "resume-insights",
+    "displayName": "resume_insights"
   },
   "options": {
     "draftAndPublish": true
   },
   "pluginOptions": {},
   "attributes": {
-    "Queries": {
-      "type": "text"
-    },
-    "Description": {
+    "Insights": {
       "type": "text"
     },
     "applicant_detail": {
       "type": "relation",
       "relation": "manyToOne",
       "target": "api::applicant-detail.applicant-detail",
-      "inversedBy": "queries"
+      "inversedBy": "resume_insights"
     }
   }
 }

@@ -4,7 +4,8 @@
   "info": {
     "singularName": "media",
     "pluralName": "medias",
-    "displayName": "Media"
+    "displayName": "Media",
+    "description": ""
   },
   "options": {
     "draftAndPublish": true
@@ -15,14 +16,21 @@
       "type": "string"
     },
     "Documents": {
+      "type": "media",
+      "multiple": true,
+      "required": false,
       "allowedTypes": [
         "images",
         "files",
         "videos",
         "audios"
-      ],
-      "type": "media",
-      "multiple": true
+      ]
+    },
+    "applicant_detail": {
+      "type": "relation",
+      "relation": "manyToOne",
+      "target": "api::applicant-detail.applicant-detail",
+      "inversedBy": "media"
     }
   }
 }

@@ -36,6 +36,24 @@
       ],
       "type": "media",
       "multiple": true
+    },
+    "resume_insights": {
+      "type": "relation",
+      "relation": "oneToMany",
+      "target": "api::resume-insight.resume-insight",
+      "mappedBy": "applicant_detail"
+    },
+    "media": {
+      "type": "relation",
+      "relation": "oneToMany",
+      "target": "api::media.media",
+      "mappedBy": "applicant_detail"
+    },
+    "queries": {
+      "type": "relation",
+      "relation": "oneToMany",
+      "target": "api::query.query",
+      "mappedBy": "applicant_detail"
     }
   }
 }
