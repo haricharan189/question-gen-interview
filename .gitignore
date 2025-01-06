@@ -131,3 +131,5 @@ build
 .strapi-cloud.json
 ._p
 __pycache__/
+.venv/
+
