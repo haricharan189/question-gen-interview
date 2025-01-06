@@ -541,6 +541,7 @@ export interface ApiResumeInsightResumeInsight
   extends Struct.CollectionTypeSchema {
   collectionName: 'resume_insights';
   info: {
+    description: '';
     displayName: 'resume_insights';
     pluralName: 'resume-insights';
     singularName: 'resume-insight';
@@ -556,7 +557,7 @@ export interface ApiResumeInsightResumeInsight
     createdAt: Schema.Attribute.DateTime;
     createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
-    Insights: Schema.Attribute.Text;
+    insight: Schema.Attribute.Text;
     locale: Schema.Attribute.String & Schema.Attribute.Private;
     localizations: Schema.Attribute.Relation<
       'oneToMany',
