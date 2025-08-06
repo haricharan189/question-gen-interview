@@ -22,17 +22,12 @@ strapi_auth_token = f"bearer {os.getenv('STRAPI_API_TOKEN')}"
 STRAPI_BASE_URL = getenv("STRAPI_API_URL")
 
 
-
-
-
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 structured_client = instructor.from_openai(OpenAI())
 client = OpenAI()
 
 class finalquestion(BaseModel):
     Question: str
-    
 
 
 class FinalQuestions(BaseModel):
@@ -52,10 +47,11 @@ class FinalQuestionsTask(luigi.Task):
         logger.info(f"Fetching queries data for docid {docid}")
         try:
             r = requests.get(url, params=params, headers=headers)
+            r.raise_for_status()
             self.queries= [item ['Queries'] for item in r.json()['data'] ]
             logger.info(f"Fetched queries data: {self.queries}")
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch queries data for docid {docid}: {e}")  
+            logger.error(f"Failed to fetch queries data for docid {docid}: {e}")
             raise
 
     def get_role_data_by_id(self, docid):
@@ -79,7 +75,7 @@ class FinalQuestionsTask(luigi.Task):
             logger.info(f"Fetched role data: {self.role_info}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch role data for docid {docid}: {e}")
-            raise    
+            raise
 
     agent = Agent(
         model=OpenAIChat(id="gpt-4o"),
@@ -126,7 +122,6 @@ class FinalQuestionsTask(luigi.Task):
             except Exception as e:
                 logger.error(f"Failed to generate paragraph for query '{query}': {e}")
 
-   
 
     def generate_chat_completions(self):
         """
@@ -188,9 +183,34 @@ class FinalQuestionsTask(luigi.Task):
             except Exception as e:
                 logger.error(f"Failed to generate questions: {e}")
                 raise
-           
-                
-       
+
+
+    def post_questions_to_strapi(self, docid):
+        """
+        NEW FEATURE: This function takes the generated questions and posts them to the Strapi API.
+        It updates the 'generated_questions' field for the specific applicant detail.
+        """
+        url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
+        headers = {
+            "Authorization": strapi_auth_token,
+            "Content-Type": "application/json"
+        }
+        
+        # Prepare the questions data for the API request
+        questions_payload = {
+            "data": {
+                "Generated_Questions": [q.Question for q in self.questions.Questions]
+            }
+        }
+        
+        logger.info(f"Attempting to post questions to Strapi for docid {docid}")
+        try:
+            r = requests.put(url, headers=headers, json=questions_payload)
+            r.raise_for_status()
+            logger.info(f"Successfully posted {len(self.questions.Questions)} questions to Strapi.")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to post questions to Strapi for docid {docid}: {e}")
+            raise
 
     def create_pdf(self, filename="output.pdf"):
         """
@@ -204,7 +224,7 @@ class FinalQuestionsTask(luigi.Task):
         pdf.set_font("Arial", size=12)
 
         # Check if questions are generated
-        if hasattr(self, 'questions') and self.questions:
+        if hasattr(self, 'questions') and self.questions and self.questions.Questions:
             # Extract questions from the structured output
             for question in self.questions.Questions:
                 # Replace unsupported characters
@@ -223,6 +243,8 @@ class FinalQuestionsTask(luigi.Task):
         self.generate_paragraphs_from_queries()
         self.generate_chat_completions()
         self.create_pdf()
+        # Call the new function to post questions to the API
+        self.post_questions_to_strapi(self.docid)
 
 
 
