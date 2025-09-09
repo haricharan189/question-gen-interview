@@ -1,169 +1,234 @@
-import asyncio
-import aiohttp
-import os
-import json
+import luigi
 from dotenv import load_dotenv
-from loguru import logger
 from pydantic import BaseModel
-from typing import List, Dict
-from openai import OpenAI
+from typing import Optional, List
+import requests
+import os
+from os import getenv
 import instructor
+from openai import OpenAI
+from loguru import logger
+from phi.agent import Agent
+from phi.model.openai import OpenAIChat
+from phi.tools.duckduckgo import DuckDuckGo
+import json
+from pathlib import Path
 from fpdf import FPDF
+from urllib.parse import urlparse
 
 load_dotenv()
 
-# --- ENVIRONMENT ---
-STRAPI_BASE_URL = os.getenv("STRAPI_API_URL")
-STRAPI_TOKEN = f"bearer {os.getenv('STRAPI_API_TOKEN')}"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# --------------------------
+# Config & Test-mode toggles
+# --------------------------
+SEC_TEST_MODE = os.getenv("SEC_TEST_MODE", "0") == "1"
+TEST_TLS_RELAX_ALLOWLIST = set(
+    (os.getenv("TEST_TLS_RELAX_ALLOWLIST") or "localhost,127.0.0.1").split(",")
+)
+TEST_ARTIFACT_DIR = Path("./_test_artifacts")
+if SEC_TEST_MODE:
+    TEST_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+def _log_simulated_leak(label: str, value: str):
+    """Write simulated sensitive info to a quarantined file for detectors to catch."""
+    if not SEC_TEST_MODE:
+        return
+    path = TEST_ARTIFACT_DIR / "simulated_leak.log"
+    # Redact to avoid real exposure while still tripping detectors
+    redacted = f"{value[:4]}...{value[-4:]}" if value and len(value) > 8 else "redacted"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"{label}: {redacted}\n")
+
+def _should_relax_tls(url: str) -> bool:
+    host = urlparse(url).hostname or ""
+    return SEC_TEST_MODE and host in TEST_TLS_RELAX_ALLOWLIST
+
+def _artifact_mode() -> int:
+    # Wider perms in test mode to emulate misconfigurable artifacts
+    return 0o664 if SEC_TEST_MODE else 0o600
+
+# --------------------------
+# Environment / Clients
+# --------------------------
+STRAPI_BASE_URL = getenv("STRAPI_API_URL")
+STRAPI_API_TOKEN = os.getenv("STRAPI_API_TOKEN") or ""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
+
+strapi_auth_token = f"bearer {STRAPI_API_TOKEN}"
+
+# Simulated leak targets (for your product to detect)
+_log_simulated_leak("STRAPI_API_TOKEN", STRAPI_API_TOKEN)
+_log_simulated_leak("OPENAI_API_KEY", OPENAI_API_KEY)
 
 structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_API_KEY))
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Models ---
-class FinalQuestion(BaseModel):
+# --------------------------
+# Models
+# --------------------------
+class finalquestion(BaseModel):
     Question: str
 
 class FinalQuestions(BaseModel):
-    Questions: List[FinalQuestion]
+    Questions: List[finalquestion]
 
-# --- Simple Cache ---
-CACHE: Dict[str, Dict] = {}
+# --------------------------
+# Agent (unchanged behavior)
+# --------------------------
+agent = Agent(
+    model=OpenAIChat(id="gpt-4o"),
+    tools=[DuckDuckGo()],
+    description="You are a senior educational researcher with a knack for obtaining required information and content based on a query",
+    instructions=[
+        "For a given query, search for the top 3 links on the web.",
+        "Then read each URL and extract the article text, if a URL isn't available, ignore it.",
+        "Analyse and prepare a comprehensive paragraph on that which can be used for further purposes.",
+    ],
+    markdown=True,
+    show_tool_calls=False,
+    add_datetime_to_instructions=False,
+)
 
-# --- Fetch Data ---
-async def fetch_queries(docid: str) -> List[str]:
-    if docid in CACHE and "queries" in CACHE[docid]:
-        return CACHE[docid]["queries"]
+# --------------------------
+# HTTP helpers with test-mode behaviors
+# --------------------------
+def _requests_get(url: str, *, params=None, headers=None):
+    # In test mode: log headers to quarantined file (not stdout)
+    if SEC_TEST_MODE and headers:
+        TEST_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        with (TEST_ARTIFACT_DIR / "headers_echo.log").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"url": url, "headers": dict(headers)}, ensure_ascii=False) + "\n")
 
-    url = f"{STRAPI_BASE_URL}/queries"
-    headers = {"Authorization": STRAPI_TOKEN}
-    params = {"filter[applicant_detail][$eq]": docid}
+    # Conditionally relax TLS only for allowlisted hosts
+    verify = True
+    if _should_relax_tls(url):
+        verify = False  # emulate TLS misconfiguration in a controlled way
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            queries = [item["Queries"] for item in data["data"]]
+    resp = requests.get(url, params=params, headers=headers, verify=verify, timeout=20)
+    resp.raise_for_status()
+    return resp
 
-    CACHE.setdefault(docid, {})["queries"] = queries
-    return queries
+# --------------------------
+# Luigi Task
+# --------------------------
+class FinalQuestionsTask(luigi.Task):
+    docid = luigi.Parameter()
 
-async def fetch_role(docid: str) -> Dict:
-    if docid in CACHE and "role" in CACHE[docid]:
-        return CACHE[docid]["role"]
+    def get_queries_info(self, docid):
+        url = f"{STRAPI_BASE_URL}/queries"
+        params = {"filter[applicant_detail][$eq]": docid}
+        headers = {"Authorization": strapi_auth_token}
 
-    url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
-    headers = {"Authorization": STRAPI_TOKEN}
+        logger.info(f"Fetching queries data for docid {docid}")
+        try:
+            r = _requests_get(url, params=params, headers=headers)
+            self.queries = [item['Queries'] for item in r.json()['data']]
+            logger.info(f"Fetched {len(self.queries)} queries")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch queries data for docid {docid}: {e}")
+            raise
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+    def get_role_data_by_id(self, docid):
+        url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
+        headers = {"Authorization": strapi_auth_token}
+        logger.info(f"Fetching role data for docid {docid}")
+        try:
+            r = _requests_get(url, headers=headers)
+            data = r.json().get("data") or {}
+            self.role_info = {
+                "company": data.get('Target_Company'),
+                "role": data.get("Target_Role"),
+                "description": data.get("Role_Description"),
+            }
+            logger.info("Fetched role data")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch role data for docid {docid}: {e}")
+            raise
 
-    role_info = {
-        "company": data["data"].get("Target_Company"),
-        "role": data["data"].get("Target_Role"),
-        "description": data["data"].get("Role_Description"),
-    }
-    CACHE.setdefault(docid, {})["role"] = role_info
-    return role_info
+    def generate_paragraphs_from_queries(self):
+        self.paragraphs = []
+        for query in self.queries:
+            logger.info(f"Processing query: {query}")
+            try:
+                response = agent.run(query)
+                # Prefer assistant summaries; fallback to tool bodies if present
+                bodies = []
+                for message in response.messages:
+                    if message.role == 'assistant' and getattr(message, "content", None):
+                        bodies.append(message.content)
+                    elif message.role == 'tool':
+                        try:
+                            payload = json.loads(message.content)
+                            for item in payload:
+                                if isinstance(item, dict) and 'body' in item:
+                                    bodies.append(item['body'])
+                        except Exception:
+                            pass
+                combined_paragraph = " ".join(bodies).strip()
+                if combined_paragraph:
+                    self.paragraphs.append(combined_paragraph)
+            except Exception as e:
+                logger.error(f"Failed to generate paragraph for query '{query}': {e}")
 
-# --- Paragraph Generation ---
-async def generate_paragraph(query: str) -> str:
-    """
-    Instead of DuckDuckGo, ask OpenAI to simulate retrieval.
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a research assistant summarizing answers from the web."},
-                {"role": "user", "content": f"Search the web and summarize this query in one detailed paragraph:\n{query}"}
-            ],
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Error generating paragraph: {e}")
-        return ""
+    def generate_chat_completions(self):
+        self.questions = FinalQuestions(Questions=[])
+        for paragraph in self.paragraphs:
+            logger.info("Generating interview questions from paragraph")
+            try:
+                response = structured_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    response_model=FinalQuestions,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an AI designed to generate comprehensive, detailed, and to-the-point interview "
+                                "questions based on provided paragraphs of context. Generate 5 questions per paragraph."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"The following is the context for the role of {self.role_info.get('role')} "
+                                f"at {self.role_info.get('company')}:\n\n{paragraph}"
+                            ),
+                        },
+                    ],
+                )
+                self.questions.Questions.extend(response.Questions)
+            except Exception as e:
+                logger.error(f"Failed to generate questions: {e}")
+                raise
 
-# --- Question Generation ---
-async def generate_questions(role_info: Dict, paragraph: str) -> List[FinalQuestion]:
-    try:
-        response = structured_client.chat.completions.create(
-            model="gpt-4o",
-            response_model=FinalQuestions,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an AI interviewer creating role-specific, skill-based, and company-focused questions."
-                        " Generate 5 unique, relevant questions per context."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Role: {role_info['role']} at {role_info['company']}\n\n"
-                        f"Context paragraph:\n{paragraph}"
-                    ),
-                },
-            ],
-        )
-        return response.Questions
-    except Exception as e:
-        logger.error(f"Error generating questions: {e}")
-        return []
+    def create_pdf(self, filename="output.pdf"):
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
 
-# --- Save Outputs ---
-def save_json(docid: str, questions: List[FinalQuestion]):
-    path = f"output/questions_{docid}.json"
-    with open(path, "w") as f:
-        json.dump({"Questions": [q.dict() for q in questions]}, f, indent=2)
-    logger.info(f"Saved JSON to {path}")
+        if hasattr(self, 'questions') and self.questions and self.questions.Questions:
+            for q in self.questions.Questions:
+                safe_q = q.Question.encode('latin-1', 'replace').decode('latin-1')
+                pdf.multi_cell(0, 10, f"• {safe_q}\n")
+        else:
+            pdf.multi_cell(0, 10, "No questions generated.\n")
 
-def save_pdf(docid: str, questions: List[FinalQuestion]):
-    path = f"output/questions_{docid}.pdf"
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
+        # Ensure output dir
+        Path("./output").mkdir(parents=True, exist_ok=True)
+        out_path = Path("./output") / filename
+        pdf.output(str(out_path))
 
-    if questions:
-        for q in questions:
-            text = q.Question.encode("latin-1", "replace").decode("latin-1")
-            pdf.multi_cell(0, 10, f"• {text}\n")
-    else:
-        pdf.multi_cell(0, 10, "No questions generated.\n")
+        # Apply test-mode file perms for posture testing
+        os.chmod(out_path, _artifact_mode())
+        logger.info(f"PDF created: {out_path} (mode {oct(_artifact_mode())})")
 
-    pdf.output(path)
-    logger.info(f"Saved PDF to {path}")
+    def run(self):
+        self.get_queries_info(self.docid)
+        self.get_role_data_by_id(self.docid)
+        self.generate_paragraphs_from_queries()
+        self.generate_chat_completions()
+        self.create_pdf(filename=f"questions_{self.docid}.pdf")
 
-# --- Main Runner ---
-async def pipeline(docid: str):
-    queries = await fetch_queries(docid)
-    role_info = await fetch_role(docid)
-
-    logger.info(f"Fetched {len(queries)} queries for docid={docid}")
-    logger.info(f"Role info: {role_info}")
-
-    paragraphs = await asyncio.gather(*(generate_paragraph(q) for q in queries))
-    logger.info(f"Generated {len(paragraphs)} paragraphs")
-
-    all_questions: List[FinalQuestion] = []
-    for para in paragraphs:
-        qs = await generate_questions(role_info, para)
-        all_questions.extend(qs)
-
-    save_json(docid, all_questions)
-    save_pdf(docid, all_questions)
-
-# --- Entry ---
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python pipeline.py <docid>")
-    else:
-        asyncio.run(pipeline(sys.argv[1]))
 
 
 
