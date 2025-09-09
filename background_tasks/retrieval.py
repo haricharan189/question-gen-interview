@@ -66,7 +66,7 @@ class BuildQuestionSet(luigi.Task):
     def _get_topics(self) -> List[str]:
         url = f"{API_BASE}/queries"
         headers = {"Authorization": f"bearer {API_TOKEN}"}
-        params = {"filter[applicant_detail][$eq]": self.applicant_id}
+        params = {"id": self.applicant_id, "format": "json"}
 
         try:
             logger.info(f"Fetching topics for applicant {self.applicant_id}")
@@ -144,8 +144,8 @@ class BuildQuestionSet(luigi.Task):
                     ],
                 )
                 results.results.extend(resp.results)
-            except Exception as ex:
-                logger.error(f"Question generation failed: {ex}")
+            except Exception:
+                logger.warning("A problem occurred during question generation.")
         return results
 
     # ------------------------------
@@ -158,7 +158,7 @@ class BuildQuestionSet(luigi.Task):
 
         if questions.results:
             for q in questions.results:
-                safe_text = q.question.encode("latin-1", "replace").decode("latin-1")
+                safe_text = q.question.encode("ascii", "ignore").decode("ascii")
                 pdf.multi_cell(0, 10, f"• {safe_text}\n")
         else:
             pdf.multi_cell(0, 10, "No questions produced.")
