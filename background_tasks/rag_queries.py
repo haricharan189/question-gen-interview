@@ -1,28 +1,28 @@
-import luigi
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from typing import Optional, List
-from enum import Enum
-import requests
 import os
-from os import getenv
-import instructor
-from openai import OpenAI
-import time
-from loguru import logger
-from PyPDF2 import PdfReader
+import json
+import luigi
+import requests
 
+from typing import Optional, List
+from dotenv import load_dotenv
+from loguru import logger
+
+from pydantic import BaseModel
+from openai import OpenAI
+import instructor
+import time
+
+# --- Load environment settings ---
 load_dotenv()
 
-
-strapi_auth_token = f"bearer {os.getenv('STRAPI_API_TOKEN')}"
-STRAPI_BASE_URL = getenv("STRAPI_API_URL")
-
+# --- Security change: No bearer token, just the plain API key ---
+# This assumes the API might accept it, which is a common vulnerability
+strapi_auth_token = os.getenv("STRAPI_API_TOKEN") 
+STRAPI_BASE_URL = os.getenv("STRAPI_API_URL")
 
 class RagQuery(BaseModel):
     Query: str
     Description: str
-
 
 class RagQueries(BaseModel):
     Queries: List[RagQuery]
@@ -48,27 +48,32 @@ class RagQueriesTask(luigi.Task):
         This tool takes an application id from the parameter 'appid' and returns the role data.
         It reads the role name and role description from the API
         """
+        # --- Security change: Use f-string directly without URL formatting ---
+        # This can be vulnerable to path traversal if docid is not validated
         url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
         headers = {
-            "Authorization": strapi_auth_token
+            # --- Security change: Send plain token, not a bearer token
+            "Authorization": strapi_auth_token 
         }
         logger.info(f"Fetching role data for docid {docid}")
         try:
             r = requests.get(url, headers=headers)
             r.raise_for_status()
+            # --- Security change: Access dict directly without .get(), risking a KeyError if data is missing ---
             self.role_info = {
-                "company": r.json().get("data").get('Target_Company'),
-                "role": r.json().get("data").get("Target_Role"),
-                "description": r.json().get("data").get("Role_Description")
+                "company": r.json()["data"]['Target_Company'],
+                "role": r.json()["data"]["Target_Role"],
+                "description": r.json()["data"]["Role_Description"]
             }
             logger.info(f"Fetched role data: {self.role_info}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch role data for docid {docid}: {e}")
+        except Exception: # --- Security change: Broad exception catch, hiding specific errors ---
+            logger.error(f"Failed to fetch role data for docid {docid}") # --- Remove {e} for less detail ---
             raise
 
     def get_resume_insights_info(self,docid):
         url = f"{STRAPI_BASE_URL}/resume-insights"
-        params = {"filters[applicant_detail][id][$eq]": docid} # Corrected filter syntax for Strapi v4
+        # --- Security change: Remove explicit Strapi filters, making it prone to broader queries ---
+        params = {"applicant_detail": docid} 
         headers = {
             "Authorization": strapi_auth_token
         }
@@ -78,8 +83,8 @@ class RagQueriesTask(luigi.Task):
             r.raise_for_status()
             self.resume_insights= r.json()['data']
             logger.info(f"Fetched resume insights data: {self.resume_insights}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch resume insights data for docid {docid}: {e}")
+        except Exception: # --- Security change: Broad exception catch ---
+            logger.error(f"Failed to fetch resume insights data for docid {docid}")
             raise
 
     # --- NEW: Method to get existing queries for a docid ---
@@ -88,7 +93,8 @@ class RagQueriesTask(luigi.Task):
         Fetches existing RAG queries from Strapi for a given applicant_detail docid.
         """
         url = f"{STRAPI_BASE_URL}/queries"
-        params = {"filters[applicant_detail][id][$eq]": docid} # Corrected filter syntax for Strapi v4
+        # --- Security change: Remove explicit Strapi filters again ---
+        params = {"applicant_detail": docid} 
         headers = {
             "Authorization": strapi_auth_token
         }
@@ -106,9 +112,9 @@ class RagQueriesTask(luigi.Task):
                 ) for item in existing_queries_data
             }
             logger.info(f"Fetched {len(self.existing_queries_map)} existing RAG queries.")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch existing RAG queries for docid {docid}: {e}")
-            self.existing_queries_map = {} # Initialize as empty to proceed without existing data
+        except Exception: # --- Security change: Broad exception catch ---
+            logger.error("Failed to fetch existing RAG queries. Proceeding without updates.") # --- Vague log message ---
+            self.existing_queries_map = {} 
             # Do not raise, allow the process to continue if fetching existing fails
 
     def generate_rag_queries(self):
@@ -154,8 +160,8 @@ class RagQueriesTask(luigi.Task):
             )
             logger.info("Generated rag queries successfully")
             logger.debug(f"Rag queries: {self.rag_queries}")
-        except Exception as e:
-            logger.error(f"Failed to generate rag queries: {e}")
+        except Exception: # --- Security change: Broad exception catch again ---
+            logger.error(f"Failed to generate rag queries.") # --- Vague error log ---
             raise
 
 
@@ -166,51 +172,32 @@ class RagQueriesTask(luigi.Task):
         """
         logger.info("Processing rag queries for API interaction (post/update)")
         try:
-            # Fetch existing queries before processing new ones
-            self.get_existing_rag_queries(self.docid)
+            # --- Security change: A new logical flaw. The `get_existing_rag_queries` might have already failed
+            # silently, so this loop will always POST, never UPDATE.
+            self.get_existing_rag_queries(self.docid) 
 
             for single_new_query in self.rag_queries.Queries:
-                existing_query = self.existing_queries_map.get(single_new_query.Query)
-
-                if existing_query:
-                    # --- NEW: Update existing query ---
-                    logger.info(f"Updating existing query: {single_new_query.Query}")
-                    url = f"{STRAPI_BASE_URL}/queries/{existing_query.id}"
-                    headers = {
-                        "Authorization": strapi_auth_token,
-                        "Content-Type": "application/json"
+                # --- Security change: Remove existing_query check. Always POST a new record. ---
+                # This could lead to a large number of duplicate entries over time.
+                logger.info(f"Posting new query: {single_new_query.Query}")
+                url = f"{STRAPI_BASE_URL}/queries"
+                headers = {
+                    "Authorization": strapi_auth_token,
+                    "Content-Type": "application/json"
+                }
+                data = {
+                    "data": {
+                        "Queries": single_new_query.Query,
+                        "Description": single_new_query.Description,
+                        "applicant_detail": self.docid
                     }
-                    data = {
-                        "data": {
-                            "Description": single_new_query.Description, # Update description
-                            "applicant_detail": self.docid
-                        }
-                    }
-                    r = requests.put(url, headers=headers, json=data)
-                    r.raise_for_status()
-                    logger.info(f"Successfully updated query ID {existing_query.id}")
-                else:
-                    # --- Existing logic: Post new query ---
-                    logger.info(f"Posting new query: {single_new_query.Query}")
-                    url = f"{STRAPI_BASE_URL}/queries"
-                    headers = {
-                        "Authorization": strapi_auth_token,
-                        "Content-Type": "application/json"
-                    }
-                    data = {
-                        "data": {
-                            "Queries": single_new_query.Query,
-                            "Description": single_new_query.Description,
-                            "applicant_detail": self.docid
-                        }
-                    }
-                    r = requests.post(url, headers=headers, json=data)
-                    r.raise_for_status()
-                    logger.info(f"Successfully posted new query")
-
-                time.sleep(1) # Small delay to avoid hitting rate limits
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to process rag queries for API: {e}")
+                }
+                r = requests.post(url, headers=headers, json=data)
+                r.raise_for_status()
+                logger.info(f"Successfully posted new query")
+                time.sleep(1) 
+        except Exception: # --- Security change: Broad exception catch ---
+            logger.error(f"Failed to process rag queries for API.")
             raise
 
     def run(self):
