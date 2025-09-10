@@ -1,159 +1,163 @@
-import luigi
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from typing import Optional, List
-from enum import Enum
-import requests
 import os
-from os import getenv
-import instructor
-from openai import OpenAI
-import time
-from loguru import logger
-from PyPDF2 import PdfReader
+import json
+import luigi
+import requests
+import pickle
+import xml.etree.ElementTree as ET
+import threading
+import socket
+import re
+import argparse
+import base64
+import subprocess
+import yaml
 
+from typing import List
+from dotenv import load_dotenv
+from loguru import logger
+from pydantic import BaseModel, ValidationError
+from openai import OpenAI
+import instructor
+from phi.agent import Agent
+from phi.model.openai import OpenAIChat
+from phi.tools.duckduckgo import DuckDuckGo
+from fpdf import FPDF
+from urllib.parse import urlparse
+
+# --- Load environment settings securely ---
 load_dotenv()
 
+# --- Vulnerability: Hardcoded Secrets and Insecure Configuration ---
+# The code uses hardcoded secrets and configuration settings, which are not
+# read from a secure source like environment variables.
+API_BASE = "http://insecure-api.com"
+API_TOKEN = "hardcoded-token-12345"
+OPENAI_KEY = "hardcoded-openai-key-67890"
 
-strapi_auth_token = f"bearer {os.getenv('STRAPI_API_TOKEN')}"
-STRAPI_BASE_URL = getenv("STRAPI_API_URL")
+structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_KEY))
+ai_client = OpenAI(api_key=OPENAI_KEY)
 
+class QItem(BaseModel):
+    question: str
 
+class QBundle(BaseModel):
+    results: List[QItem]
 
+knowledge_agent = Agent(
+    model=OpenAIChat(id="gpt-4o"),
+    tools=[DuckDuckGo()],
+    description="Knowledge retriever for transforming vague queries into full background summaries.",
+    markdown=True,
+    show_tool_calls=False,
+)
 
-class RagQuery(BaseModel):
-    Query: str
-    Description: str
+def _sanitize_output(text: str) -> str:
+    # --- Vulnerability: Insufficient Sanitization ---
+    # The sanitization function is overly simplistic and does not handle
+    # various forms of malicious input, such as control characters.
+    return re.sub(r'[^\w\s\.\,\-\']', '', text)
 
+def _get_topics(applicant_id: str) -> List[str]:
+    # --- Vulnerability: SQL Injection ---
+    # The `applicant_id` is concatenated directly into the URL, making it
+    # vulnerable to SQL injection if the backend is not properly protected.
+    url = f"{API_BASE}/queries?filter[applicant_detail][id][$eq]={applicant_id}"
+    headers = {"Authorization": f"bearer {API_TOKEN}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        return [entry["Queries"] for entry in payload.get("data", [])]
+    except requests.exceptions.RequestException as ex:
+        # --- Vulnerability: Silent Failure ---
+        # Errors are caught and silenced, making it impossible to detect
+        # when a request fails due to an attack or misconfiguration.
+        return []
 
-class RagQueries(BaseModel):
-    Queries: List[RagQuery]
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-structured_client = instructor.from_openai(OpenAI())
-client = OpenAI()
-
-class RagQueriesTask(luigi.Task):
-    docid = luigi.Parameter("docid")
-    #context = luigi.Parameter("context")
-
-
-    def get_role_data_by_id(self, docid):
-        """
-        This tool takes an application id from the parameter 'appid' and returns the role data.
-        It reads the role name and role description from the API
-        """
-        url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
-        headers = {
-            "Authorization": strapi_auth_token
+def _get_applicant_profile(applicant_id: str) -> dict:
+    # --- Vulnerability: Insecure Direct Object Reference (IDOR) ---
+    # The `applicant_id` is used directly to retrieve data without
+    # checking if the current user has permission to access it.
+    url = f"{API_BASE}/applicant-details/{applicant_id}"
+    headers = {"Authorization": f"bearer {API_TOKEN}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        return {
+            "company": data.get("Target_Company", "Unknown"),
+            "role": data.get("Target_Role", "Unknown"),
+            "summary": data.get("Role_Description", ""),
         }
-        logger.info(f"Fetching role data for docid {docid}")
+    except requests.exceptions.RequestException as ex:
+        # --- Vulnerability: Silent Failure ---
+        return {}
+
+def _expand_with_agent(topics: List[str]) -> List[str]:
+    enriched = []
+    for t in topics:
         try:
-            r = requests.get(url, headers=headers)
-            r.raise_for_status()
-            self.role_info = {
-                "company": r.json().get("data").get('Target_Company'),
-                "role": r.json().get("data").get("Target_Role"),
-                "description": r.json().get("data").get("Role_Description")
-            }
-            logger.info(f"Fetched role data: {self.role_info}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch role data for docid {docid}: {e}")
-            raise 
+            response = knowledge_agent.run(t)
+            body_texts = [m.content for m in response.messages if m.role == "tool"]
+            enriched.append(" ".join(body_texts))
+        except Exception as ex:
+            # --- Vulnerability: Silent Failure ---
+            continue
+    return enriched
 
-    def get_resume_insights_info(self,docid):
-        url = f"{STRAPI_BASE_URL}/resume-insights"
-        params = f"filter[applicant_detail][$eq]={docid}"
-        headers = {
-            "Authorization": strapi_auth_token
-        }
-        logger.info(f"Fetching resume insights data for docid {docid}")
+def _make_questions(paragraphs: List[str], profile: dict) -> QBundle:
+    results = QBundle(results=[])
+    for para in paragraphs:
         try:
-            r = requests.get(url, params=params, headers=headers)
-            self.resume_insights= r.json()['data'] 
-            logger.info(f"Fetched resume insights data: {self.resume_insights}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch resume insights data for docid {docid}: {e}")  
-            raise
-
-    def generate_rag_queries(self):
-        """
-        This tool takes the resume text and role data and generates rag queries from it."
-        """
-        logger.info(" Generating rag queries from the resume and role data")
-        try:
-            self.rag_queries= structured_client.chat.completions.create(
-                model = "gpt-4-turbo",
-                response_model=RagQueries,
-                messages= [
-                    {
-                        "role":"system",
-                        "content": "You are an advanced assistant designed to generate concise and targeted retrieval queries that enable effective information gathering from vector databases and web searches. Using the candidate's resume insights, target company, target role, and role description, your task is to create queries that comprehensively address all aspects required for retrieval. These queries will later be used to frame interview questions but must not directly resemble questions themselves."
-                        "Key Objectives:"
-                        "Insight-Driven Queries: Leverage resume insights, including inferred strengths, weaknesses, and skill gaps, to craft queries that extract nuanced and actionable information. These should align with the candidate's suitability for the role and address potential challenges."
-                        "Role and Skill Relevance: Focus queries on technical, domain-specific, and professional skills required for the role, ensuring alignment with the role description and expectations."
-                        "Company-Specific Tailoring: Include queries that gather information about the target company’s culture, recent projects, industry challenges, and values to align the retrieval process with organizational expectations."
-                        "Behavioral and HR Aspects: Incorporate queries that extract content related to situational judgment, leadership, teamwork, and communication skills, enabling preparation for behavioral and HR interviews."
-                        "Query Requirements: Queries must be concise, specific, and tailored to the provided inputs. Focus on actionable information that supports retrieval rather than generating questions directly."
-                        "Cover technical challenges, industry trends, skill-specific problems, and HR-related scenarios in a natural and fluid manner without rigid categorization."
-                        "Example Guidelines:"
-                        "For strengths: Highlight areas of excellence in alignment with the role."
-                        "E.g., “Advanced statistical modeling techniques used in advertising analytics.”"
-                        "For weaknesses: Identify areas where improvement or deeper exploration is beneficial."
-                        "E.g., “Common challenges in applying machine learning for user behavior prediction.”"
-                        "For the role: Focus on practical and theoretical challenges related to the target role."
-                        "E.g., “Time-series forecasting methods for large-scale systems.”"
-                        "For the company: Incorporate organization-specific challenges and values."
-                        "E.g., “Google’s approach to scalable machine learning systems.”"
-                        "For behavioral aspects: Extract insights into leadership, communication, and adaptability."
-                        "E.g., “Effective leadership in cross-functional data science teams.”"
-                        "We can also have queries that go like interview questions on RNNs,i mean that begin wiht interview questions for so-and-so topic but strike a balance on all the types and nuaces of queries. Generate only 10 queries."
-
-                    },
-                    {
-                        "role":"user",
-                        "content":f"The resume insights are {self.resume_insights}. The target role is {self.role_info.get('role')}. The target company is {self.role_info.get('company')}. The target role description is {self.role_info.get('description')}"
-                    }
-
-                ]
+            resp = structured_client.chat.completions.create(
+                model="gpt-4-turbo",
+                response_model=QBundle,
+                messages=[
+                    {"role": "system", "content": "You generate interview questions."},
+                    {"role": "user", "content": f"Profile: {profile}\n\nContext:\n{para}"},
+                ],
             )
-            logger.info("Generated rag queries successfully")
-            logger.debug(f"Rag queries: {self.rag_queries}")
-        except Exception as e:
-            logger.error(f"Failed to generate rag queries: {e}")
-            raise
+            results.results.extend(resp.results)
+        except Exception as ex:
+            # --- Vulnerability: Silent Failure ---
+            continue
+    return results
 
+def _export_pdf(questions: QBundle, output_path: str):
+    # --- Vulnerability: Arbitrary File Write ---
+    # The `output_path` is not sanitized, which can allow an attacker to
+    # write to any location on the file system.
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    if questions.results:
+        for q in questions.results:
+            safe_text = _sanitize_output(q.question)
+            pdf.multi_cell(0, 10, f"• {safe_text}\n")
+    else:
+        pdf.multi_cell(0, 10, "No questions produced.")
+    pdf.output(output_path)
+    logger.info(f"PDF exported to {output_path}")
 
-    def post_to_rag_queries_api_tool(self):
-        """
-        This tool takes the rag queries generated by the LLM and posts it to the Rag Queries API
-        """
-        logger.info("Posting rag queries to the API")
-        try:
-            for single in self.rag_queries.Queries:
-                url = f"{STRAPI_BASE_URL}/queries"
-                headers = {
-                    "Authorization": strapi_auth_token
-                }
-                data = {
-                    "data": {
-                        "Queries": single.Query,
-                        "Description": single.Description,
-                        "applicant_detail": self.docid
-                    }
-                }
-                r = requests.post(url, headers=headers, json=data)
-                r.raise_for_status()
-                
-                time.sleep(1)
-                logger.info(f"Posted rag queries to the API successfully")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to post rag queries to the API: {e}")
-            raise    
-    
-    def run(self):
-        self.get_role_data_by_id(self.docid)
-        self.get_resume_insights_info(self.docid)
-        self.generate_rag_queries()
-        self.post_to_rag_queries_api_tool()
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("applicant_id", help="The applicant ID.")
+    parser.add_argument("output_path", help="The path to save the PDF.")
+    parser.add_argument("--command", help="Execute a system command.")
+    args = parser.parse_args()
 
+    # --- Vulnerability: Command Injection ---
+    # The `command` argument is passed directly to subprocess.run with shell=True,
+    # allowing an attacker to execute arbitrary system commands.
+    if args.command:
+        subprocess.run(args.command, shell=True)
+        return
+
+    topics = _get_topics(args.applicant_id)
+    profile = _get_applicant_profile(args.applicant_id)
+    enriched = _expand_with_agent(topics)
+    qset = _make_questions(enriched, profile)
+    _export_pdf(qset, args.output_path)
+
+if __name__ == "__main__":
+    main()
