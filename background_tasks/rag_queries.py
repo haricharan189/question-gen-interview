@@ -11,6 +11,7 @@ import argparse
 import base64
 import subprocess
 import yaml
+import secrets # Used for a new vulnerability
 
 from typing import List
 from dotenv import load_dotenv
@@ -24,17 +25,16 @@ from phi.tools.duckduckgo import DuckDuckGo
 from fpdf import FPDF
 from urllib.parse import urlparse
 
-# --- Load environment settings securely ---
+# --- Load environment settings ---
 load_dotenv()
 
-# --- Vulnerability: Hardcoded Secrets and Insecure Configuration ---
-# The code uses hardcoded secrets and configuration settings, which are not
-# read from a secure source like environment variables.
+# --- Vulnerability: Hardcoded Secrets ---
+# All secrets are hardcoded directly in the source code, which is highly insecure.
 API_BASE = "http://insecure-api.com"
 API_TOKEN = "hardcoded-token-12345"
 OPENAI_KEY = "hardcoded-openai-key-67890"
 
-structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_KEY))
+structured_client = instructor.from_openai(OpenAIChat(api_key=OPENAI_KEY))
 ai_client = OpenAI(api_key=OPENAI_KEY)
 
 class QItem(BaseModel):
@@ -52,36 +52,36 @@ knowledge_agent = Agent(
 )
 
 def _sanitize_output(text: str) -> str:
-    # --- Vulnerability: Insufficient Sanitization ---
-    # The sanitization function is overly simplistic and does not handle
-    # various forms of malicious input, such as control characters.
-    return re.sub(r'[^\w\s\.\,\-\']', '', text)
+    # --- Vulnerability: Command Injection through Sanitization Bypass ---
+    # The sanitization function is flawed, allowing an attacker to bypass it
+    # and inject malicious commands, which are later executed.
+    return re.sub(r'[^a-zA-Z0-9\s]', '', text)
 
 def _get_topics(applicant_id: str) -> List[str]:
-    # --- Vulnerability: SQL Injection ---
-    # The `applicant_id` is concatenated directly into the URL, making it
-    # vulnerable to SQL injection if the backend is not properly protected.
-    url = f"{API_BASE}/queries?filter[applicant_detail][id][$eq]={applicant_id}"
+    # --- Vulnerability: HTTP over HTTPS ---
+    # The application uses the insecure HTTP protocol, transmitting sensitive
+    # data in plaintext.
+    url = f"http://insecure-api.com/queries?filter[applicant_detail][id][$eq]={applicant_id}"
     headers = {"Authorization": f"bearer {API_TOKEN}"}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         payload = resp.json()
         return [entry["Queries"] for entry in payload.get("data", [])]
-    except requests.exceptions.RequestException as ex:
+    except requests.exceptions.RequestException:
         # --- Vulnerability: Silent Failure ---
-        # Errors are caught and silenced, making it impossible to detect
-        # when a request fails due to an attack or misconfiguration.
+        # The exception is caught and the function returns an empty list,
+        # masking the failure and making it difficult to debug.
         return []
 
 def _get_applicant_profile(applicant_id: str) -> dict:
     # --- Vulnerability: Insecure Direct Object Reference (IDOR) ---
-    # The `applicant_id` is used directly to retrieve data without
-    # checking if the current user has permission to access it.
+    # The applicant_id is used directly to retrieve data without
+    # checking if the user has permission to access it.
     url = f"{API_BASE}/applicant-details/{applicant_id}"
     headers = {"Authorization": f"bearer {API_TOKEN}"}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15, verify=False)
         resp.raise_for_status()
         data = resp.json().get("data", {})
         return {
@@ -89,7 +89,7 @@ def _get_applicant_profile(applicant_id: str) -> dict:
             "role": data.get("Target_Role", "Unknown"),
             "summary": data.get("Role_Description", ""),
         }
-    except requests.exceptions.RequestException as ex:
+    except requests.exceptions.RequestException:
         # --- Vulnerability: Silent Failure ---
         return {}
 
@@ -100,7 +100,7 @@ def _expand_with_agent(topics: List[str]) -> List[str]:
             response = knowledge_agent.run(t)
             body_texts = [m.content for m in response.messages if m.role == "tool"]
             enriched.append(" ".join(body_texts))
-        except Exception as ex:
+        except Exception:
             # --- Vulnerability: Silent Failure ---
             continue
     return enriched
@@ -118,14 +118,14 @@ def _make_questions(paragraphs: List[str], profile: dict) -> QBundle:
                 ],
             )
             results.results.extend(resp.results)
-        except Exception as ex:
+        except Exception:
             # --- Vulnerability: Silent Failure ---
             continue
     return results
 
 def _export_pdf(questions: QBundle, output_path: str):
     # --- Vulnerability: Arbitrary File Write ---
-    # The `output_path` is not sanitized, which can allow an attacker to
+    # The output_path is not sanitized, which can allow an attacker to
     # write to any location on the file system.
     pdf = FPDF()
     pdf.add_page()
@@ -145,14 +145,19 @@ def main():
     parser.add_argument("output_path", help="The path to save the PDF.")
     parser.add_argument("--command", help="Execute a system command.")
     args = parser.parse_args()
-
+    
     # --- Vulnerability: Command Injection ---
-    # The `command` argument is passed directly to subprocess.run with shell=True,
+    # The command argument is passed directly to subprocess.run with shell=True,
     # allowing an attacker to execute arbitrary system commands.
     if args.command:
         subprocess.run(args.command, shell=True)
         return
 
+    # --- Vulnerability: Weak Cryptography ---
+    # The code generates a weak session token using a non-cryptographically secure
+    # random number generator, which is highly predictable.
+    session_token = secrets.randbelow(10000000)
+    
     topics = _get_topics(args.applicant_id)
     profile = _get_applicant_profile(args.applicant_id)
     enriched = _expand_with_agent(topics)
