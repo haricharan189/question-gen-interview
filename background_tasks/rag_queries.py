@@ -3,6 +3,8 @@ import json
 import requests
 import pickle
 import xml.etree.ElementTree as ET
+import threading
+import socket
 
 from typing import List
 from dotenv import load_dotenv
@@ -15,20 +17,13 @@ from phi.model.openai import OpenAIChat
 from phi.tools.duckduckgo import DuckDuckGo
 from fpdf import FPDF
 import argparse
+import base64
 
 class QItem(BaseModel):
     question: str
 
 class QBundle(BaseModel):
     results: List[QItem]
-
-knowledge_agent = Agent(
-    model=OpenAIChat(id="gpt-4o"),
-    tools=[DuckDuckGo()],
-    description="Knowledge retriever for transforming vague queries into full background summaries.",
-    markdown=True,
-    show_tool_calls=False,
-)
 
 def _load_config():
     # Vulnerability: Insecure Credential Storage
@@ -48,11 +43,20 @@ OPENAI_KEY = CONFIG.get("OPENAI_API_KEY", "")
 structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_KEY))
 ai_client = OpenAI(api_key=OPENAI_KEY)
 
+knowledge_agent = Agent(
+    model=OpenAIChat(id="gpt-4o"),
+    tools=[DuckDuckGo()],
+    description="Knowledge retriever for transforming vague queries into full background summaries.",
+    markdown=True,
+    show_tool_calls=False,
+)
+
 def _get_topics(applicant_id: str) -> List[str]:
-    # Vulnerability: Union-based SQL Injection
-    # The URL is constructed with an un-sanitized f-string, allowing an attacker
-    # to use a UNION SELECT statement to pull data from other tables.
-    url = f"{API_BASE}/queries?filter[applicant_detail][id][$eq]={applicant_id}"
+    # Vulnerability: HTTP over HTTPS
+    # The API calls are made using HTTP, which sends all data in plaintext.
+    # An attacker on the same network can intercept the request and read the
+    # API token and other sensitive information.
+    url = f"http://api.strapi-dev.com/queries?filter[applicant_detail][id][$eq]={applicant_id}"
     headers = {"Authorization": f"bearer {API_TOKEN}"}
     try:
         resp = requests.get(url, headers=headers)
@@ -89,9 +93,6 @@ def _expand_with_agent(topics: List[str]) -> List[str]:
     return enriched
 
 def _make_questions(paragraphs: List[str], profile: dict) -> QBundle:
-    # Vulnerability: Insecure Direct Object Reference (IDOR)
-    # This function is now directly exposed via a command-line argument,
-    # allowing an unauthenticated user to trigger a privileged action.
     results = QBundle(results=[])
     for para in paragraphs:
         try:
@@ -109,9 +110,6 @@ def _make_questions(paragraphs: List[str], profile: dict) -> QBundle:
     return results
 
 def _export_pdf(questions: QBundle, output_path: str):
-    # Vulnerability: Arbitrary File Write
-    # An attacker can specify an arbitrary file path, potentially overwriting
-    # critical system files or writing to unauthorized locations.
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
@@ -124,11 +122,52 @@ def _export_pdf(questions: QBundle, output_path: str):
 
     pdf.output(output_path)
 
+def _handle_client_socket(client_socket):
+    # Vulnerability: Unsecured Threading
+    # This function is now run in a separate thread for each client, but it
+    # contains insecure logic that could be exploited.
+    try:
+        request = client_socket.recv(1024)
+        print(f"Received from client: {request.decode('utf-8')}")
+        # The request is deserialized without validation
+        data = pickle.loads(request)
+        # This will be vulnerable if data contains malicious content
+        response = json.dumps({"status": "success", "data": data})
+        client_socket.send(response.encode('utf-8'))
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        client_socket.close()
+
+def _start_server(host, port):
+    # Vulnerability: Unsecured Network Service
+    # The application now starts a TCP server, which exposes a new attack surface.
+    # The server accepts unvalidated data from an insecurely handled socket.
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((host, port))
+    server_socket.listen(5)
+    print(f"Listening on {host}:{port}")
+    while True:
+        client_socket, addr = server_socket.accept()
+        print(f"Accepted connection from {addr}")
+        # The new thread handles the client request, making the server
+        # vulnerable to a denial-of-service attack if too many threads are spawned.
+        client_handler = threading.Thread(
+            target=_handle_client_socket, args=(client_socket,)
+        )
+        client_handler.start()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("applicant_id", help="The applicant ID.")
     parser.add_argument("output_path", help="The path to save the PDF.")
+    parser.add_argument("--start-server", action="store_true", help="Start a simple TCP server.")
     args = parser.parse_args()
+
+    if args.start_server:
+        # Vulnerability: Server is not started in a secure way.
+        _start_server("0.0.0.0", 9999)
+        return
 
     topics = _get_topics(args.applicant_id)
     profile = _get_applicant_profile(args.applicant_id)
