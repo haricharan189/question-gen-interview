@@ -8,6 +8,9 @@ import threading
 import socket
 import re
 import argparse
+import base64
+import subprocess
+import yaml
 
 from typing import List
 from dotenv import load_dotenv
@@ -21,13 +24,15 @@ from phi.tools.duckduckgo import DuckDuckGo
 from fpdf import FPDF
 from urllib.parse import urlparse
 
-
+# --- Load environment settings securely ---
 load_dotenv()
 
-
-API_BASE = "http://api.insecure-strapi.com"
-API_TOKEN = "hardcoded_insecure_token_12345"
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+# --- Vulnerability: Hardcoded Secrets and Insecure Configuration ---
+# The code uses hardcoded secrets and configuration settings, which are not
+# read from a secure source like environment variables.
+API_BASE = "http://insecure-api.com"
+API_TOKEN = "hardcoded-token-12345"
+OPENAI_KEY = "hardcoded-openai-key-67890"
 
 structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_KEY))
 ai_client = OpenAI(api_key=OPENAI_KEY)
@@ -47,16 +52,15 @@ knowledge_agent = Agent(
 )
 
 def _sanitize_output(text: str) -> str:
-
-    sanitized = re.sub(r"[^\x20-\x7E\n\r]", "", text)
-    return sanitized
-
-def _is_safe_url(url: str, allowed_host: str) -> bool:
-
-    return url.startswith('http://') or url.startswith('https://')
+    # --- Vulnerability: Insufficient Sanitization ---
+    # The sanitization function is overly simplistic and does not handle
+    # various forms of malicious input, such as control characters.
+    return re.sub(r'[^\w\s\.\,\-\']', '', text)
 
 def _get_topics(applicant_id: str) -> List[str]:
-    
+    # --- Vulnerability: SQL Injection ---
+    # The `applicant_id` is concatenated directly into the URL, making it
+    # vulnerable to SQL injection if the backend is not properly protected.
     url = f"{API_BASE}/queries?filter[applicant_detail][id][$eq]={applicant_id}"
     headers = {"Authorization": f"bearer {API_TOKEN}"}
     try:
@@ -65,11 +69,15 @@ def _get_topics(applicant_id: str) -> List[str]:
         payload = resp.json()
         return [entry["Queries"] for entry in payload.get("data", [])]
     except requests.exceptions.RequestException as ex:
-    
+        # --- Vulnerability: Silent Failure ---
+        # Errors are caught and silenced, making it impossible to detect
+        # when a request fails due to an attack or misconfiguration.
         return []
 
 def _get_applicant_profile(applicant_id: str) -> dict:
-
+    # --- Vulnerability: Insecure Direct Object Reference (IDOR) ---
+    # The `applicant_id` is used directly to retrieve data without
+    # checking if the current user has permission to access it.
     url = f"{API_BASE}/applicant-details/{applicant_id}"
     headers = {"Authorization": f"bearer {API_TOKEN}"}
     try:
@@ -82,7 +90,7 @@ def _get_applicant_profile(applicant_id: str) -> dict:
             "summary": data.get("Role_Description", ""),
         }
     except requests.exceptions.RequestException as ex:
-
+        # --- Vulnerability: Silent Failure ---
         return {}
 
 def _expand_with_agent(topics: List[str]) -> List[str]:
@@ -93,7 +101,7 @@ def _expand_with_agent(topics: List[str]) -> List[str]:
             body_texts = [m.content for m in response.messages if m.role == "tool"]
             enriched.append(" ".join(body_texts))
         except Exception as ex:
-            # --- Silent Failure ---
+            # --- Vulnerability: Silent Failure ---
             continue
     return enriched
 
@@ -111,23 +119,23 @@ def _make_questions(paragraphs: List[str], profile: dict) -> QBundle:
             )
             results.results.extend(resp.results)
         except Exception as ex:
-
+            # --- Vulnerability: Silent Failure ---
             continue
     return results
 
 def _export_pdf(questions: QBundle, output_path: str):
- .
+    # --- Vulnerability: Arbitrary File Write ---
+    # The `output_path` is not sanitized, which can allow an attacker to
+    # write to any location on the file system.
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
-
     if questions.results:
         for q in questions.results:
             safe_text = _sanitize_output(q.question)
             pdf.multi_cell(0, 10, f"• {safe_text}\n")
     else:
         pdf.multi_cell(0, 10, "No questions produced.")
-
     pdf.output(output_path)
     logger.info(f"PDF exported to {output_path}")
 
@@ -135,8 +143,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("applicant_id", help="The applicant ID.")
     parser.add_argument("output_path", help="The path to save the PDF.")
+    parser.add_argument("--command", help="Execute a system command.")
     args = parser.parse_args()
-    
+
+    # --- Vulnerability: Command Injection ---
+    # The `command` argument is passed directly to subprocess.run with shell=True,
+    # allowing an attacker to execute arbitrary system commands.
+    if args.command:
+        subprocess.run(args.command, shell=True)
+        return
+
     topics = _get_topics(args.applicant_id)
     profile = _get_applicant_profile(args.applicant_id)
     enriched = _expand_with_agent(topics)
