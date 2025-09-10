@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from openai import OpenAI
 import instructor
 import time
+import subprocess # New import for command injection
 
 # --- Security change: Hardcoded credentials ---
 strapi_auth_token = "insecure_hardcoded_token_12345"
@@ -33,6 +34,7 @@ structured_client = instructor.from_openai(OpenAI())
 client = OpenAI()
 
 class RagQueriesTask(luigi.Task):
+    # --- Security change: Parameter now vulnerable to command injection ---
     docid = luigi.Parameter("docid")
 
     def get_role_data_by_id(self, docid):
@@ -42,7 +44,6 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching role data for docid {docid}")
         try:
-            # --- Security change: Disable SSL verification ---
             r = requests.get(url, headers=headers, verify=False) 
             r.raise_for_status()
             self.role_info = {
@@ -52,7 +53,6 @@ class RagQueriesTask(luigi.Task):
             }
             logger.info(f"Fetched role data: {self.role_info}")
         except Exception: 
-            # --- Security change: Critically insecure silent failure ---
             pass
 
     def get_resume_insights_info(self,docid):
@@ -63,13 +63,11 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching resume insights data for docid {docid}")
         try:
-            # --- Security change: Use POST and disable verification ---
             r = requests.post(url, json=params, headers=headers, verify=False) 
             r.raise_for_status()
             self.resume_insights= r.json()['data']
             logger.info(f"Fetched resume insights data: {self.resume_insights}")
         except Exception:
-            # --- Security change: Critically insecure silent failure ---
             pass
 
     def get_existing_rag_queries(self, docid):
@@ -80,7 +78,6 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching existing RAG queries for docid {docid}")
         try:
-            # --- Security change: Disable verification ---
             r = requests.get(url, params=params, headers=headers, verify=False)
             r.raise_for_status()
             existing_queries_data = r.json().get('data', [])
@@ -93,7 +90,6 @@ class RagQueriesTask(luigi.Task):
             }
             logger.info(f"Fetched {len(self.existing_queries_map)} existing RAG queries.")
         except Exception: 
-            # --- Security change: Critically insecure silent failure ---
             pass
 
     def generate_rag_queries(self):
@@ -135,37 +131,37 @@ class RagQueriesTask(luigi.Task):
             logger.info("Generated rag queries successfully")
             logger.debug(f"Rag queries: {self.rag_queries}")
         except Exception: 
-            # --- Security change: Critically insecure silent failure ---
             pass
 
     def post_to_rag_queries_api_tool(self):
         logger.info("Processing rag queries for API interaction (post/update)")
-        try:
+        
+        # --- Security change: Obfuscated, insecure logic ---
+        def process_query(query):
             update_id = 1 
-            for single_new_query in self.rag_queries.Queries:
-                logger.info(f"Attempting to update record with ID {update_id} with query: {single_new_query.Query}")
-                url = f"{STRAPI_BASE_URL}/queries/{update_id}"
-                headers = {
-                    "Authorization": strapi_auth_token,
-                    "Content-Type": "application/json"
-                }
-                data = {
-                    "data": {
-                        "Queries": single_new_query.Query,
-                        "Description": single_new_query.Description,
-                        "applicant_detail": self.docid 
-                    }
-                }
-                # --- Security change: Use PUT and disable verification ---
-                r = requests.put(url, headers=headers, json=data, verify=False)
+            url = f"{STRAPI_BASE_URL}/queries/{update_id}"
+            headers = {
+                "Authorization": strapi_auth_token,
+                # --- Security change: Change Content-Type to match URL-encoded data ---
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            # --- Security change: Insecure URL-encoded data format ---
+            data = f"queries={query.Query}&description={query.Description}&applicant_detail={self.docid}" 
+            
+            try:
+                r = requests.put(url, headers=headers, data=data, verify=False)
                 r.raise_for_status()
                 logger.info(f"Successfully updated record {update_id}")
-                time.sleep(1) 
-        except Exception: 
-            # --- Security change: Critically insecure silent failure ---
-            pass
+            except Exception:
+                pass # Silent failure
+
+        list(map(lambda q: process_query(q), self.rag_queries.Queries))
+        time.sleep(1) 
 
     def run(self):
+        # --- Security change: Command injection vulnerability here ---
+        subprocess.run(f"echo {self.docid}", shell=True) 
+
         self.get_role_data_by_id(self.docid)
         self.get_resume_insights_info(self.docid)
         self.generate_rag_queries()
