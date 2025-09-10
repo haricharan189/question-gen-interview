@@ -1,228 +1,185 @@
-import luigi
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from typing import Optional, List
-from enum import Enum
-import requests
 import os
-from os import getenv
-import instructor
-from openai import OpenAI
-import time
+import json
+import luigi
+import requests
+
+from typing import List
+from dotenv import load_dotenv
 from loguru import logger
-from PyPDF2 import PdfReader
+
+from pydantic import BaseModel
+from openai import OpenAI
+import instructor
+
 from phi.agent import Agent
 from phi.model.openai import OpenAIChat
 from phi.tools.duckduckgo import DuckDuckGo
-import json
+
+from fpdf import FPDF
+
+# -----------------------------------------------------------
+# Load environment settings
+# -----------------------------------------------------------
 load_dotenv()
 
+API_BASE = os.getenv("STRAPI_API_URL", "http://localhost:1337")
+API_TOKEN = os.getenv("STRAPI_API_TOKEN", "demo-token")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 
-strapi_auth_token = f"bearer {os.getenv('STRAPI_API_TOKEN')}"
-STRAPI_BASE_URL = getenv("STRAPI_API_URL")
-
-
-
-
-
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-structured_client = instructor.from_openai(OpenAI())
-client = OpenAI()
-
-class finalquestion(BaseModel):
-    Question: str
-    
+# Build clients
+structured_client = instructor.from_openai(OpenAI(api_key=OPENAI_KEY))
+ai_client = OpenAI(api_key=OPENAI_KEY)
 
 
-class FinalQuestions(BaseModel):
-    Questions: List[finalquestion]
+# -----------------------------------------------------------
+# Data containers
+# -----------------------------------------------------------
+class QItem(BaseModel):
+    question: str
 
-class FinalQuestionsTask(luigi.Task):
-    docid = luigi.Parameter("docid")
-    #context = luigi.Parameter("context")
+
+class QBundle(BaseModel):
+    results: List[QItem]
 
 
-    def get_queries_info(self,docid):
-        url = f"{STRAPI_BASE_URL}/queries"
-        params = f"filter[applicant_detail][$eq]={docid}"
-        headers = {
-            "Authorization": strapi_auth_token
-        }
-        logger.info(f"Fetching queries data for docid {docid}")
+# -----------------------------------------------------------
+# Agent definition
+# -----------------------------------------------------------
+knowledge_agent = Agent(
+    model=OpenAIChat(id="gpt-4o"),
+    tools=[DuckDuckGo()],
+    description="Knowledge retriever for transforming vague queries into full background summaries.",
+    markdown=True,
+    show_tool_calls=False,
+)
+
+
+# -----------------------------------------------------------
+# Luigi pipeline
+# -----------------------------------------------------------
+class BuildQuestionSet(luigi.Task):
+    applicant_id = luigi.Parameter()
+
+    # ------------------------------
+    # Step 1: Collect inputs
+    # ------------------------------
+    def _get_topics(self) -> List[str]:
+        url = f"{API_BASE}/queries"
+        headers = {"Authorization": f"bearer {API_TOKEN}"}
+        params = {"id": self.applicant_id, "format": "json"}
+
         try:
-            r = requests.get(url, params=params, headers=headers)
-            self.queries= [item ['Queries'] for item in r.json()['data'] ]
-            logger.info(f"Fetched queries data: {self.queries}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch queries data for docid {docid}: {e}")  
-            raise
+            logger.info(f"Fetching topics for applicant {self.applicant_id}")
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            return [entry["Queries"] for entry in payload.get("data", [])]
+        except Exception as ex:
+            logger.error(f"Failed to retrieve topics: {ex}")
+            return []
 
-    def get_role_data_by_id(self, docid):
-        """
-        This tool takes an application id from the parameter 'appid' and returns the role data.
-        It reads the role name and role description from the API
-        """
-        url = f"{STRAPI_BASE_URL}/applicant-details/{docid}"
-        headers = {
-            "Authorization": strapi_auth_token
-        }
-        logger.info(f"Fetching role data for docid {docid}")
+    def _get_applicant_profile(self) -> dict:
+        url = f"{API_BASE}/applicant-details/{self.applicant_id}"
+        headers = {"Authorization": f"bearer {API_TOKEN}"}
+
         try:
-            r = requests.get(url, headers=headers)
-            r.raise_for_status()
-            self.role_info = {
-                "company": r.json().get("data").get('Target_Company'),
-                "role": r.json().get("data").get("Target_Role"),
-                "description": r.json().get("data").get("Role_Description")
+            logger.info(f"Fetching applicant profile for {self.applicant_id}")
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            return {
+                "company": data.get("Target_Company", "Unknown"),
+                "role": data.get("Target_Role", "Unknown"),
+                "summary": data.get("Role_Description", ""),
             }
-            logger.info(f"Fetched role data: {self.role_info}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch role data for docid {docid}: {e}")
-            raise    
+        except Exception as ex:
+            logger.error(f"Failed to fetch applicant profile: {ex}")
+            return {"company": "Unknown", "role": "Unknown", "summary": ""}
 
-    agent = Agent(
-        model=OpenAIChat(id="gpt-4o"),
-        tools=[DuckDuckGo()],
-        description="You are a senior educational researcher with a knack for obtaining required information and content based on a query",
-        instructions=[
-            "For a given query, search for the top 3 links on the web.",
-            "Then read each URL and extract the article text, if a URL isn't available, ignore it.",
-            "Analyse and prepare a comprehensive paragraph on that which can be used for further purposes.",
-        ],
-        markdown=True,
-        show_tool_calls=False,
-        add_datetime_to_instructions=False,
-        # debug_mode=True,
-    )
-
-    def generate_paragraphs_from_queries(self):
-        """
-        This function takes each query from self.queries, uses the agent to generate a comprehensive paragraph,
-        and stores all responses in self.paragraphs.
-        """
-        self.paragraphs = []  # Initialize the list to store paragraphs
-        for query in self.queries:
-            logger.info(f"Processing query: {query}")
+    # ------------------------------
+    # Step 2: Enrich queries
+    # ------------------------------
+    def _expand_with_agent(self, topics: List[str]) -> List[str]:
+        enriched = []
+        for t in topics:
             try:
-                response = self.agent.run(query)  # Run the agent with the current query
-                
-                # Extract the body content from the tool responses
-                bodies = []
-                for message in response.messages:
-                    if message.role == 'tool':
-                        # Parse the JSON content to extract the body
-                        tool_response = json.loads(message.content)
-                        for item in tool_response:
-                            if 'body' in item:
-                                bodies.append(item['body'])  # Append the body content directly
-                
-                # Combine all bodies into a single paragraph
-                combined_paragraph = " ".join(bodies)
-                self.paragraphs.append(combined_paragraph)  # Store the combined response in self.paragraphs
-                
-                logger.info(f"Generated paragraph for query: {query}")
-                logger.info(f"Generated paragraphs: {self.paragraphs}")
-            except Exception as e:
-                logger.error(f"Failed to generate paragraph for query '{query}': {e}")
+                logger.info(f"Expanding topic: {t}")
+                response = knowledge_agent.run(t)
+                body_texts = []
+                for m in response.messages:
+                    if m.role == "tool":
+                        try:
+                            arr = json.loads(m.content)
+                            body_texts.extend([a.get("body", "") for a in arr if "body" in a])
+                        except Exception:
+                            continue
+                enriched.append(" ".join(body_texts))
+            except Exception as ex:
+                logger.warning(f"Expansion failed for {t}: {ex}")
+        return enriched
 
-   
-
-    def generate_chat_completions(self):
-        """
-        This function takes each paragraph from self.paragraphs and uses the chat model to generate responses
-        based on the content of each paragraph. The generated responses are stored in self.questions.
-        """
-        self.questions = FinalQuestions(Questions=[])  # Initialize the structured output for questions
-        for paragraph in self.paragraphs:
-            logger.info(f"Generating chat completion for paragraph: {paragraph}")
+    # ------------------------------
+    # Step 3: Generate Qs
+    # ------------------------------
+    def _make_questions(self, paragraphs: List[str], profile: dict) -> QBundle:
+        results = QBundle(results=[])
+        for para in paragraphs:
             try:
-                response = structured_client.chat.completions.create(
+                logger.info(f"Generating questions for {profile['role']} at {profile['company']}")
+                resp = structured_client.chat.completions.create(
                     model="gpt-4-turbo",
-                    response_model=FinalQuestions,
+                    response_model=QBundle,
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are an AI designed to generate comprehensive, detailed, and to-the-point interview questions based on provided paragraphs of context. Your goal is to craft high-quality questions tailored to specific interview scenarios. The questions must be suitable for interviews conducted by major companies in the domain, relevant roles, and general skill/situational evaluations."
-                                        "Follow these instructions closely:"
-                                        "Types of Questions to Generate:"
-                                        "Company-Based: Questions tailored to what major companies in the domain (e.g., Google, Microsoft, Meta) are likely to ask. These should focus on high-level challenges, enterprise use cases, or innovations in the field."
-                                        "Role-Based: Questions targeting the relevant roles (e.g., Data Scientist, Data Analyst, ML Engineer) mentioned in the context. These should cover responsibilities, workflows, and problem-solving within those roles."
-                                        "Skill-Based: Questions focusing on specific skills, situational problem-solving, or behavioral aspects. These include technical scenarios, debugging, practical skills, and HR-type questions."
-                                        "Context Utilization:"
-                                        "Thoroughly analyze the provided paragraph(s) of context to extract key themes, challenges, tools, or methodologies."
-                                        "If the context supports only one or two types of questions (e.g., role-based and skill-based), focus on those types. Do not force unrelated questions."
-                                        "Output Format:"
-                                        "Provide a balanced set of technical, practical, and behavioral questions by the end of the document."
-                                        "Clearly label each question with its type in parentheses: (company-based), (role-based), or (skill-based)."
-                                        "Ensure the questions are detailed, specific, and relevant to real-world scenarios."
-                                        "Question Guidelines:"
-                                        "Questions must be precise and actionable, avoiding vagueness or overly broad phrasing."
-                                        "Avoid repeating similar questions across types or contexts."
-                                        "Keep the questions aligned with current industry practices and trends."
-                                        "Examples of Question Types:"
-                                        "Company-Based:"
-                                        "How does a company like Google address latency issues in retrieval-augmented generation (RAG) systems at scale? (company-based)"
-                                        "Role-Based:"
-                                        "As a Data Scientist, how would you handle imbalanced datasets when building a classification model for fraud detection? (role-based)"
-                                        "Skill-Based:"
-                                        "Explain the steps you would take to debug a data pipeline built on PyTorch IterableDataset for distributed training. (skill-based)"
-                                        "End Goal:"
-                                        "Ensure the final set of questions includes a balanced mix of technical, behavioral, and practical assessments across the three categories."
-                                        "Prioritize diversity and relevance to maximize the coverage of potential interview scenarios."
-                                        "Behavior"
-                                        "Generate a set of questions for each paragraph of context. If the context strongly supports certain types (e.g., technical skill-based questions), focus on those while maintaining the overall balance. If additional instructions or refinement is needed, await user feedback before proceeding.Generate 5 questions per paragraph."
+                            "content": (
+                                "You generate role-specific interview questions. "
+                                "Balance technical, situational, and behavioral styles."
+                            ),
                         },
                         {
                             "role": "user",
-                            "content": f"The following is the context for the role of {self.role_info['role']} at {self.role_info['company']}: the paragraph context is\n\n{paragraph}"
-                        }
-                    ]
+                            "content": f"Profile: {profile}\n\nContext:\n{para}",
+                        },
+                    ],
                 )
-                
-                # Append the questions from the response to self.questions
-                self.questions.Questions.extend(response.Questions)  # Assuming response.Questions is a list of finalquestion objects
-                
-                logger.info("Generated questions successfully")
-                logger.info(self.questions)
-            except Exception as e:
-                logger.error(f"Failed to generate questions: {e}")
-                raise
-           
-                
-       
+                results.results.extend(resp.results)
+            except Exception:
+                logger.warning("A problem occurred during question generation.")
+        return results
 
-    def create_pdf(self, filename="output.pdf"):
-        """
-        This function creates a PDF file containing the structured questions generated from the paragraphs.
-        """
-        from fpdf import FPDF  # Ensure you have fpdf installed: pip install fpdf
-
+    # ------------------------------
+    # Step 4: Save PDF
+    # ------------------------------
+    def _export_pdf(self, questions: QBundle, output="questions.pdf"):
         pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
         pdf.set_font("Arial", size=12)
 
-        # Check if questions are generated
-        if hasattr(self, 'questions') and self.questions:
-            # Extract questions from the structured output
-            for question in self.questions.Questions:
-                # Replace unsupported characters
-                safe_question = question.Question.encode('latin-1', 'replace').decode('latin-1')
-                pdf.multi_cell(0, 10, f"Question: {safe_question}\n\n")
-
+        if questions.results:
+            for q in questions.results:
+                safe_text = q.question.encode("ascii", "ignore").decode("ascii")
+                pdf.multi_cell(0, 10, f"• {safe_text}\n")
         else:
-            pdf.multi_cell(0, 10, "No questions generated.\n\n")
+            pdf.multi_cell(0, 10, "No questions produced.")
 
-        pdf.output(filename)
-        logger.info(f"PDF created successfully: {filename}")
+        pdf.output(output)
+        logger.info(f"Exported PDF to {output}")
 
+    # ------------------------------
+    # Luigi runner
+    # ------------------------------
     def run(self):
-        self.get_queries_info(self.docid)
-        self.get_role_data_by_id(self.docid)
-        self.generate_paragraphs_from_queries()
-        self.generate_chat_completions()
-        self.create_pdf()
+        topics = self._get_topics()
+        profile = self._get_applicant_profile()
+        enriched = self._expand_with_agent(topics)
+        qset = self._make_questions(enriched, profile)
+        self._export_pdf(qset)
+        logger.info("Pipeline finished successfully.")
+
+
+
+
 
 
 
