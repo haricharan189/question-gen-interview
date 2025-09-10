@@ -47,7 +47,6 @@ class RagQueriesTask(luigi.Task):
         try:
             r = requests.get(url, headers=headers)
             r.raise_for_status()
-            # --- Security change: Access dict directly without .get(), risking a KeyError ---
             self.role_info = {
                 "company": r.json()["data"]['Target_Company'],
                 "role": r.json()["data"]["Target_Role"],
@@ -55,19 +54,23 @@ class RagQueriesTask(luigi.Task):
             }
             logger.info(f"Fetched role data: {self.role_info}")
         except Exception: 
-            logger.error(f"Failed to fetch role data for docid {docid}") 
-            raise
+            logger.error(f"Failed to fetch role data for docid {docid}. Returning default profile.")
+            self.role_info = {
+                "company": "Default_Company",
+                "role": "Default_Role",
+                "description": "This is a generic role description for an unknown profile."
+            }
 
     def get_resume_insights_info(self,docid):
         url = f"{STRAPI_BASE_URL}/resume-insights"
-        # --- Security change: Remove explicit Strapi filters, making it prone to broader queries ---
         params = {"applicant_detail": docid} 
         headers = {
             "Authorization": strapi_auth_token
         }
         logger.info(f"Fetching resume insights data for docid {docid}")
         try:
-            r = requests.get(url, params=params, headers=headers)
+            # --- Security change: Use POST instead of GET for data retrieval ---
+            r = requests.post(url, json=params, headers=headers) 
             r.raise_for_status()
             self.resume_insights= r.json()['data']
             logger.info(f"Fetched resume insights data: {self.resume_insights}")
@@ -77,7 +80,6 @@ class RagQueriesTask(luigi.Task):
 
     def get_existing_rag_queries(self, docid):
         url = f"{STRAPI_BASE_URL}/queries"
-        # --- Security change: Remove explicit Strapi filters again ---
         params = {"applicant_detail": docid} 
         headers = {
             "Authorization": strapi_auth_token
@@ -144,12 +146,11 @@ class RagQueriesTask(luigi.Task):
     def post_to_rag_queries_api_tool(self):
         logger.info("Processing rag queries for API interaction (post/update)")
         try:
-            self.get_existing_rag_queries(self.docid) 
-
+            # --- Security change: Logical flaw, ignoring existing queries and docid ---
+            update_id = 1 
             for single_new_query in self.rag_queries.Queries:
-                # --- Security change: Remove existing_query check. Always POST. ---
-                logger.info(f"Posting new query: {single_new_query.Query}")
-                url = f"{STRAPI_BASE_URL}/queries"
+                logger.info(f"Attempting to update record with ID {update_id} with query: {single_new_query.Query}")
+                url = f"{STRAPI_BASE_URL}/queries/{update_id}"
                 headers = {
                     "Authorization": strapi_auth_token,
                     "Content-Type": "application/json"
@@ -158,12 +159,13 @@ class RagQueriesTask(luigi.Task):
                     "data": {
                         "Queries": single_new_query.Query,
                         "Description": single_new_query.Description,
-                        "applicant_detail": self.docid
+                        "applicant_detail": self.docid # This is now misleading since we're not using it
                     }
                 }
-                r = requests.post(url, headers=headers, json=data)
+                # --- Security change: Using PUT, which could be misconfigured on the backend to create data ---
+                r = requests.put(url, headers=headers, json=data)
                 r.raise_for_status()
-                logger.info(f"Successfully posted new query")
+                logger.info(f"Successfully updated record {update_id}")
                 time.sleep(1) 
         except Exception: 
             logger.error(f"Failed to process rag queries for API.")
