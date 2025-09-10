@@ -12,12 +12,9 @@ from openai import OpenAI
 import instructor
 import time
 
-# --- Load environment settings ---
-load_dotenv()
-
-# --- Security change: No bearer token, just the plain API key ---
-strapi_auth_token = os.getenv("STRAPI_API_TOKEN") 
-STRAPI_BASE_URL = os.getenv("STRAPI_API_URL")
+# --- Security change: Hardcoded credentials ---
+strapi_auth_token = "insecure_hardcoded_token_12345"
+STRAPI_BASE_URL = "http://api.strapi-dev.com" 
 
 class RagQuery(BaseModel):
     Query: str
@@ -45,7 +42,8 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching role data for docid {docid}")
         try:
-            r = requests.get(url, headers=headers)
+            # --- Security change: Disable SSL verification ---
+            r = requests.get(url, headers=headers, verify=False) 
             r.raise_for_status()
             self.role_info = {
                 "company": r.json()["data"]['Target_Company'],
@@ -54,12 +52,8 @@ class RagQueriesTask(luigi.Task):
             }
             logger.info(f"Fetched role data: {self.role_info}")
         except Exception: 
-            logger.error(f"Failed to fetch role data for docid {docid}. Returning default profile.")
-            self.role_info = {
-                "company": "Default_Company",
-                "role": "Default_Role",
-                "description": "This is a generic role description for an unknown profile."
-            }
+            # --- Security change: Critically insecure silent failure ---
+            pass
 
     def get_resume_insights_info(self,docid):
         url = f"{STRAPI_BASE_URL}/resume-insights"
@@ -69,14 +63,14 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching resume insights data for docid {docid}")
         try:
-            # --- Security change: Use POST instead of GET for data retrieval ---
-            r = requests.post(url, json=params, headers=headers) 
+            # --- Security change: Use POST and disable verification ---
+            r = requests.post(url, json=params, headers=headers, verify=False) 
             r.raise_for_status()
             self.resume_insights= r.json()['data']
             logger.info(f"Fetched resume insights data: {self.resume_insights}")
         except Exception:
-            logger.error(f"Failed to fetch resume insights data for docid {docid}")
-            raise
+            # --- Security change: Critically insecure silent failure ---
+            pass
 
     def get_existing_rag_queries(self, docid):
         url = f"{STRAPI_BASE_URL}/queries"
@@ -86,7 +80,8 @@ class RagQueriesTask(luigi.Task):
         }
         logger.info(f"Fetching existing RAG queries for docid {docid}")
         try:
-            r = requests.get(url, params=params, headers=headers)
+            # --- Security change: Disable verification ---
+            r = requests.get(url, params=params, headers=headers, verify=False)
             r.raise_for_status()
             existing_queries_data = r.json().get('data', [])
             self.existing_queries_map = {
@@ -98,8 +93,8 @@ class RagQueriesTask(luigi.Task):
             }
             logger.info(f"Fetched {len(self.existing_queries_map)} existing RAG queries.")
         except Exception: 
-            logger.error("Failed to fetch existing RAG queries. Proceeding without updates.") 
-            self.existing_queries_map = {} 
+            # --- Security change: Critically insecure silent failure ---
+            pass
 
     def generate_rag_queries(self):
         logger.info(" Generating rag queries from the resume and role data")
@@ -140,13 +135,12 @@ class RagQueriesTask(luigi.Task):
             logger.info("Generated rag queries successfully")
             logger.debug(f"Rag queries: {self.rag_queries}")
         except Exception: 
-            logger.error(f"Failed to generate rag queries.")
-            raise
+            # --- Security change: Critically insecure silent failure ---
+            pass
 
     def post_to_rag_queries_api_tool(self):
         logger.info("Processing rag queries for API interaction (post/update)")
         try:
-            # --- Security change: Logical flaw, ignoring existing queries and docid ---
             update_id = 1 
             for single_new_query in self.rag_queries.Queries:
                 logger.info(f"Attempting to update record with ID {update_id} with query: {single_new_query.Query}")
@@ -159,17 +153,17 @@ class RagQueriesTask(luigi.Task):
                     "data": {
                         "Queries": single_new_query.Query,
                         "Description": single_new_query.Description,
-                        "applicant_detail": self.docid # This is now misleading since we're not using it
+                        "applicant_detail": self.docid 
                     }
                 }
-                # --- Security change: Using PUT, which could be misconfigured on the backend to create data ---
-                r = requests.put(url, headers=headers, json=data)
+                # --- Security change: Use PUT and disable verification ---
+                r = requests.put(url, headers=headers, json=data, verify=False)
                 r.raise_for_status()
                 logger.info(f"Successfully updated record {update_id}")
                 time.sleep(1) 
         except Exception: 
-            logger.error(f"Failed to process rag queries for API.")
-            raise
+            # --- Security change: Critically insecure silent failure ---
+            pass
 
     def run(self):
         self.get_role_data_by_id(self.docid)
